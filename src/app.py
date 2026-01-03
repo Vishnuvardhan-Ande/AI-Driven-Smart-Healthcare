@@ -1,6 +1,5 @@
 import os
 import io
-import json
 import numpy as np
 import pandas as pd
 import pickle
@@ -11,6 +10,10 @@ import traceback
 import matplotlib
 matplotlib.use("Agg")  
 import matplotlib.pyplot as plt
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+
 
 from flask import Flask, render_template, request, send_file, redirect, url_for, session, flash
 from reportlab.lib.pagesizes import A4
@@ -47,29 +50,9 @@ print("STATIC_DIR:", STATIC_DIR)
 
 # LOAD MODELS
 print("Loading image model...")
-# Load model without compiling (for inference only - handles custom loss function)
-try:
-    image_model = tf.keras.models.load_model(os.path.join(MODELS_DIR, "dense_best.h5"), compile=False)
-except Exception as e:
-    print(f"Warning: Could not load model with compile=False: {e}")
-    print("Attempting to load with custom loss function...")
-    from tensorflow.keras import backend as K
-    def focal_loss(gamma=2.0, alpha=0.25):
-        def focal_loss_fixed(y_true, y_pred):
-            epsilon = K.epsilon()
-            y_pred = K.clip(y_pred, epsilon, 1.0 - epsilon)
-            p_t = tf.where(K.equal(y_true, 1), y_pred, 1 - y_pred)
-            alpha_factor = K.ones_like(y_true) * alpha
-            alpha_t = tf.where(K.equal(y_true, 1), alpha_factor, 1 - alpha_factor)
-            cross_entropy = -K.log(p_t)
-            weight = alpha_t * K.pow((1 - p_t), gamma)
-            loss = weight * cross_entropy
-            return K.mean(loss)
-        return focal_loss_fixed
-    image_model = tf.keras.models.load_model(
-        os.path.join(MODELS_DIR, "dense_best.h5"),
-        custom_objects={'focal_loss_fixed': focal_loss(2.0, 0.25)}
-    )
+#image_model = tf.keras.models.load_model(os.path.join(MODELS_DIR, "dense_best.h5"))
+image_model = tf.keras.models.load_model("models/image_model.h5", compile=False)
+
 
 print("Loading clinical model & scaler...")
 with open(os.path.join(MODELS_DIR, "clinical_best.pkl"), "rb") as f:
