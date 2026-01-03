@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: smart-healthcare-ai
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn src.app:app
+    plan: free

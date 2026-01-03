@@ -1,0 +1,17 @@
+flask
+tensorflow>=2.11
+keras
+pillow
+numpy
+opencv-python
+matplotlib
+scikit-learn
+shap
+joblib
+werkzeug>=2.0
+catboost
+xgboost
+lightgbm
+pandas
+reportlab
+gunicorn
