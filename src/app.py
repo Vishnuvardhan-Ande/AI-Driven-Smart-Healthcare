@@ -1,31 +1,29 @@
 import os
 import io
-import json
 import numpy as np
 import pandas as pd
 import pickle
 import tensorflow as tf
+import keras
 import shap
 import cv2
 import traceback
 import matplotlib
+import json
+from werkzeug.security import generate_password_hash, check_password_hash
+from flask import flash
 matplotlib.use("Agg")  
 import matplotlib.pyplot as plt
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"
-os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 
-
-from flask import Flask, render_template, request, send_file, redirect, url_for, session, flash
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.enums import TA_CENTER
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image
+from flask import Flask, render_template, request, send_file, redirect, url_for, session, jsonify
+from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
 from reportlab.lib.pagesizes import A4
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image as RLImage, KeepTogether
+from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib.units import inch
-from reportlab.lib import colors
-from datetime import timedelta, datetime
-
-from auth import init_db, create_user, verify_user
+from reportlab.lib.utils import ImageReader
+from xml.sax.saxutils import escape
+import re
 
 # PATHS & FLASK SETUP
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -36,15 +34,41 @@ UPLOADS_DIR = os.path.join(STATIC_DIR, "uploads")
 OUTPUTS_DIR = os.path.join(STATIC_DIR, "outputs")
 MODELS_DIR = os.path.join(PROJECT_ROOT, "models")
 DATA_DIR = os.path.join(PROJECT_ROOT, "data", "clinical")
+USERS_FILE = os.path.join(PROJECT_ROOT, "users.json")
 
 os.makedirs(UPLOADS_DIR, exist_ok=True)
 os.makedirs(OUTPUTS_DIR, exist_ok=True)
 
 app = Flask(__name__, template_folder=TEMPLATES_DIR, static_folder=STATIC_DIR)
-app.secret_key = os.environ.get("FLASK_SECRET_KEY", "dev-secret-key-change-me")
-app.permanent_session_lifetime = timedelta(days=7)
+app.config['SECRET_KEY'] = 'healthcare-secret-key-2024'
+login_manager = LoginManager()
+login_manager.init_app(app)
+login_manager.login_view = 'auth'
 
-init_db()
+# User class
+class User(UserMixin):
+    def __init__(self, id, email, name):
+        self.id = id
+        self.email = email
+        self.name = name
+
+@login_manager.user_loader
+def load_user(user_id):
+    if os.path.exists(USERS_FILE):
+        with open(USERS_FILE, 'r') as f:
+            users = json.load(f)
+            for user in users:
+                if user['id'] == user_id:
+                    return User(user['id'], user['email'], user['name'])
+    return None
+
+# Initialize users file
+def init_users_file():
+    if not os.path.exists(USERS_FILE):
+        with open(USERS_FILE, 'w') as f:
+            json.dump([], f)
+
+init_users_file()
 
 print("PROJECT_ROOT:", PROJECT_ROOT)
 print("TEMPLATES_DIR:", TEMPLATES_DIR)
@@ -52,9 +76,19 @@ print("STATIC_DIR:", STATIC_DIR)
 
 # LOAD MODELS
 print("Loading image model...")
-#image_model = tf.keras.models.load_model(os.path.join(MODELS_DIR, "dense_best.h5"))
-image_model = tf.keras.models.load_model("models/dense_best.h5", compile=False)
 
+class PatchedInputLayer(keras.layers.InputLayer):
+    @classmethod
+    def from_config(cls, config):
+        if "batch_input_shape" not in config and "shape" not in config:
+            config["batch_input_shape"] = (None, 224, 224, 3)
+        return super().from_config(config)
+
+image_model = keras.models.load_model(
+    os.path.join(MODELS_DIR, "dense_best.h5"),
+    custom_objects={"InputLayer": PatchedInputLayer},
+    compile=False,
+)
 
 print("Loading clinical model & scaler...")
 with open(os.path.join(MODELS_DIR, "clinical_best.pkl"), "rb") as f:
@@ -63,22 +97,6 @@ with open(os.path.join(MODELS_DIR, "clinical_best_scaler.pkl"), "rb") as f:
     clinical_scaler = pickle.load(f)
 
 explainer = shap.TreeExplainer(clinical_model)
-
-# Fusion configuration
-FUSION_W_IMAGE = 0.85
-FUSION_W_CLINICAL = 0.15
-FUSION_THRESHOLD = 0.5
-try:
-    fusion_cfg_path = os.path.join(MODELS_DIR, "fusion_config.json")
-    if os.path.exists(fusion_cfg_path):
-        with open(fusion_cfg_path, "r") as f:
-            cfg = json.load(f)
-            FUSION_W_IMAGE = cfg.get("w_image", FUSION_W_IMAGE)
-            FUSION_W_CLINICAL = cfg.get("w_clinical", 1.0 - FUSION_W_IMAGE)
-            FUSION_THRESHOLD = cfg.get("threshold", FUSION_THRESHOLD)
-            print("Loaded fusion_config.json:", cfg)
-except Exception as e:
-    print("Using default fusion weights due to error loading fusion_config.json:", e)
 
 # UTIL: image preprocessing
 IMG_SIZE = (224, 224)
@@ -99,14 +117,14 @@ def generate_gradcam_overlay(image_path, out_name="gradcam_overlay.png"):
 
     last_conv = None
     for layer in reversed(image_model.layers):
-        if isinstance(layer, tf.keras.layers.Conv2D):
+        if isinstance(layer, keras.layers.Conv2D):
             last_conv = layer
             break
     if last_conv is None:
         raise RuntimeError("No Conv2D layer found in model for Grad-CAM.")
 
-    grad_model = tf.keras.models.Model(inputs=image_model.inputs,
-                                       outputs=[last_conv.output, image_model.output])
+    grad_model = keras.models.Model(inputs=image_model.inputs,
+                                    outputs=[last_conv.output, image_model.output])
 
     with tf.GradientTape() as tape:
         conv_out, preds = grad_model(img_arr)
@@ -195,143 +213,125 @@ def generate_shap_plots(clinical_values, sample_name_prefix="shap"):
 
     return ("/static/outputs/" + os.path.basename(summary_path)) if summary_path else None, "/static/outputs/" + os.path.basename(waterfall_path)
 
-# PDF report generation 
-def generate_pdf_report(patient_name, age, fever_days, spo2, cough, smoking, diabetes,
-                        img_pred, clinical_pred, fusion_pred,image_rel,gradcam_rel,shap_summary_rel,shap_waterfall_rel,
-                        xray_path, gradcam_path, shap_summary_path, shap_waterfall_path,
-                        output_path):
+# PDF report generation
+def _to_paragraph_text(text: str) -> str:
+    """Convert plain/markdown-ish text to safe Paragraph markup."""
+    if not text:
+        return ""
+    # Basic markdown bold -> reportlab <b>
+    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
+    # Strip emoji bullets that can render as tofu in PDF fonts
+    text = (
+        text.replace("🔴 ", "")
+        .replace("🟠 ", "")
+        .replace("🟡 ", "")
+        .replace("🟢 ", "")
+    )
+    # Escape XML entities, keep our <b> tags intact by escaping first then unescaping tags
+    text = escape(text)
+    text = text.replace("&lt;b&gt;", "<b>").replace("&lt;/b&gt;", "</b>")
+    # Preserve newlines
+    text = text.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "<br/>")
+    return text
 
-    def risk_label(score):
-        if score < 0.30:
-            return "LOW RISK"
-        elif score < 0.60:
-            return "MODERATE RISK"
-        else:
-            return "HIGH RISK"
 
+def _scaled_rl_image(path: str, max_width: float, max_height: float) -> RLImage:
+    reader = ImageReader(path)
+    iw, ih = reader.getSize()
+    if not iw or not ih:
+        return RLImage(path, width=max_width, height=max_height)
+    scale = min(max_width / float(iw), max_height / float(ih))
+    return RLImage(path, width=float(iw) * scale, height=float(ih) * scale)
+
+
+def generate_pdf_report(
+    patient_info,
+    image_rel,
+    gradcam_rel,
+    shap_summary_rel,
+    shap_wf_rel,
+    predictions,
+    explanation_text,
+    final_diagnosis=None,
+    fusion_pred=None,
+    risk_band=None,
+    out_name="report.pdf",
+):
+    out_path = os.path.join(OUTPUTS_DIR, out_name)
+    # Slightly tighter margins helps keep sections + images together
+    doc = SimpleDocTemplate(out_path, pagesize=A4, leftMargin=36, rightMargin=36, topMargin=36, bottomMargin=36)
     styles = getSampleStyleSheet()
-    title_style = ParagraphStyle("Title", alignment=TA_CENTER, fontSize=18, spaceAfter=12)
-    header_style = ParagraphStyle("Header", fontSize=13, textColor=colors.darkblue, spaceBefore=12)
-    body = styles["BodyText"]
-
-    doc = SimpleDocTemplate(output_path, pagesize=A4, rightMargin=40, leftMargin=40)
-
     story = []
 
-    # Title
-    story.append(Paragraph("AI-Driven Smart Healthcare Diagnostic Report", title_style))
-    story.append(Paragraph("<b>Chest X-ray & Clinical Fusion Analysis</b>", styles["Italic"]))
+    story.append(Paragraph("AI Healthcare Diagnosis Report", styles["Title"]))
     story.append(Spacer(1, 12))
+    story.append(Paragraph("Patient & Input Details:", styles["Heading2"]))
+    for k,v in patient_info.items():
+        story.append(Paragraph(f"<b>{k}:</b> {v}", styles["Normal"]))
+    story.append(Spacer(1,12))
 
-    # Patient Info
-    story.append(Paragraph("Patient Information", header_style))
-    story.append(Paragraph(f"<b>Name:</b> {patient_name}", body))
-    story.append(Paragraph(f"<b>Age:</b> {age}", body))
-    story.append(Paragraph(f"<b>Study Date:</b> {datetime.now().strftime('%d-%m-%Y %I:%M %p')}", body))
+    story.append(Paragraph("Predictions:", styles["Heading2"]))
+    for k,v in predictions.items():
+        story.append(Paragraph(f"<b>{k}:</b> {v}", styles["Normal"]))
+    story.append(Spacer(1,12))
 
-    story.append(Spacer(1, 10))
+    story.append(Paragraph("Model Explanation (short):", styles["Heading2"]))
+    story.append(Paragraph(_to_paragraph_text(explanation_text), styles["Normal"]))
+    story.append(Spacer(1,12))
 
-    # Clinical Summary
-    story.append(Paragraph("Clinical Parameters", header_style))
-    story.append(Paragraph(f"Fever Duration: {fever_days} days", body))
-    story.append(Paragraph(f"SpO₂ Level: {spo2} %", body))
-    story.append(Paragraph(f"Cough Present: {'Yes' if cough else 'No'}", body))
-    story.append(Paragraph(f"Smoking History: {'Yes' if smoking else 'No'}", body))
-    story.append(Paragraph(f"Diabetes History: {'Yes' if diabetes else 'No'}", body))
+    # Add images (scaled)
+    image_paths = []
+    if image_rel: image_paths.append((os.path.join(PROJECT_ROOT, image_rel.lstrip("/")), "Original X-ray"))
+    if gradcam_rel: image_paths.append((os.path.join(PROJECT_ROOT, gradcam_rel.lstrip("/")), "Grad-CAM overlay"))
+    if shap_summary_rel: image_paths.append((os.path.join(PROJECT_ROOT, shap_summary_rel.lstrip("/")), "SHAP summary"))
+    if shap_wf_rel: image_paths.append((os.path.join(PROJECT_ROOT, shap_wf_rel.lstrip("/")), "SHAP waterfall"))
 
-    # Scores
-    story.append(Paragraph("Model Prediction Scores", header_style))
-    story.append(Paragraph(f"Image CNN Probability: {round(img_pred*100,2)} %", body))
-    story.append(Paragraph(f"Clinical ML Probability: {round(clinical_pred*100,2)} %", body))
-    story.append(Paragraph(f"<b>Final Fusion Probability: {round(fusion_pred*100,2)} %</b>", body))
+    # Keep images and headings together and scaled to avoid page splits
+    max_w = 6.8 * inch
+    max_h = 3.2 * inch
 
-    # Final Diagnosis
-    story.append(Paragraph("AI Risk Assessment", header_style))
-    risk = risk_label(fusion_pred)
+    for p, title in image_paths:
+        try:
+            block = [
+                Paragraph(title, styles["Heading3"]),
+                Spacer(1, 6),
+                _scaled_rl_image(p, max_width=max_w, max_height=max_h),
+                Spacer(1, 10),
+            ]
+            story.append(KeepTogether(block))
+        except Exception as e:
+            print("Skipping image in PDF due to:", e)
 
-    explanation = {
-        "LOW RISK": "No significant pneumonia patterns were detected. Clinical vitals remain within normal range.",
-        "MODERATE RISK": "Early signs of pulmonary infection were detected. Preventive clinical evaluation is advised.",
-        "HIGH RISK": "Significant lung infection features consistent with pneumonia were detected. Immediate medical consultation is strongly recommended."
-    }
+    if final_diagnosis:
+        story.append(Spacer(1, 8))
+        story.append(Paragraph("Final Interpretation:", styles["Heading2"]))
+        story.append(Paragraph(_to_paragraph_text(final_diagnosis), styles["Normal"]))
 
-    story.append(Paragraph(f"<b>Risk Level:</b> {risk}", body))
-    story.append(Paragraph(explanation[risk], body))
-
-    # Images
-    story.append(Paragraph("Explainability Visualizations", header_style))
-    story.append(Image(xray_path, 2.3*inch, 2.3*inch))
-    story.append(Image(gradcam_path, 2.3*inch, 2.3*inch))
-    if shap_summary_path:
-        story.append(Image(shap_summary_path, 2.3*inch, 2.3*inch))
-    story.append(Image(shap_waterfall_path, 2.3*inch, 2.3*inch))
-
-    # Disclaimer
-    story.append(Spacer(1, 12))
-    story.append(Paragraph("<b>Medical Disclaimer:</b> This AI-generated report is intended for clinical decision support only and must be validated by a qualified medical professional.", styles["Italic"]))
+    # Always end with a concise final prediction block
+    if fusion_pred is not None or risk_band:
+        story.append(Spacer(1, 10))
+        story.append(Paragraph("Final Prediction:", styles["Heading2"]))
+        lines = []
+        if fusion_pred is not None:
+            try:
+                lines.append(f"<b>Fusion probability:</b> {float(fusion_pred) * 100:.1f}% ({float(fusion_pred):.3f})")
+            except Exception:
+                lines.append(f"<b>Fusion probability:</b> {fusion_pred}")
+        if risk_band:
+            lines.append(f"<b>Risk band:</b> {escape(str(risk_band))}")
+        story.append(Paragraph("<br/>".join(lines), styles["Normal"]))
 
     doc.build(story)
-    return "/static/outputs/" + os.path.basename(output_path)
+    return "/static/outputs/" + out_name
 
-# Short explanation generator with causes, symptoms and factors
+# Short explanation generator
 def make_explanation_text(pred_img, pred_clinical, fusion, shap_wf_rel):
-    """
-    Generate a clinician‑friendly textual explanation using model outputs.
-    SHAP is still used internally to determine influential clinical factors,
-    but plots are not exposed in the UI.
-    """
     try:
-        risk_pct = fusion * 100
-        if risk_pct >= 80:
-            risk_band = "very high"
-        elif risk_pct >= 60:
-            risk_band = "high"
-        elif risk_pct >= 30:
-            risk_band = "moderate"
-        else:
-            risk_band = "low"
-
-        # Simple SHAP‑based reasoning: which features pushed risk up the most?
-        reason_text = ""
-        try:
-            # construct a single‑row frame matching training columns
-            # (ordering consistent with generate_shap_plots)
-            feats = ["age", "fever_days", "spo2", "cough", "smoking", "diabetes"]
-            # NOTE: caller is responsible for passing raw clinical values in same order
-            # we recompute shap values for this one point
-            # (uses tree explainer for the clinical model)
-            # build df with placeholder; actual values passed to explainer in generate_shap_plots
-            pass
-        except Exception:
-            reason_text = ""
-
-        if risk_band in ["very high", "high"]:
-            clinical_text = (
-                "The AI system estimates a high probability of pneumonia. This is driven by the combination of "
-                "abnormal chest X‑ray findings and high‑risk clinical features such as reduced oxygen saturation, "
-                "prolonged fever and the presence of cough. Older age, smoking history or diabetes further increase "
-                "the likelihood of true infection. Immediate clinical assessment and correlation with laboratory and "
-                "radiology reports are recommended."
-            )
-        elif risk_band == "moderate":
-            clinical_text = (
-                "The fused risk score falls in the moderate range. Subtle opacities on the X‑ray together with clinical "
-                "features such as several days of fever, mild desaturation or persistent cough suggest early or evolving "
-                "infection. Close monitoring and repeat assessment may be appropriate depending on the clinical context."
-            )
-        else:
-            clinical_text = (
-                "The estimated probability of pneumonia is low. The chest X‑ray does not show convincing consolidation "
-                "and the clinical profile (fever duration, SpO2, cough, smoking status, diabetes) is overall low risk. "
-                "If the patient deteriorates clinically or develops new symptoms, re‑evaluation is advised."
-            )
-
-        text = (
-            f"The image model probability is {pred_img:.3f} and the clinical model probability is {pred_clinical:.3f}. "
-            f"Combining both sources, the fused pneumonia risk is {fusion:.3f} ({risk_pct:.1f}%), which falls in the "
-            f"{risk_band.upper()} risk band. "
-            + clinical_text
-        )
+        important = []
+        text = (f"The image model predicts probability {pred_img:.3f} and the clinical model predicts {pred_clinical:.3f}. "
+                f"The fused score (average) is {fusion:.3f}. The top contributing clinical features (from SHAP) "
+                f"are shown in the SHAP plots. Positive SHAP bars increase the predicted risk while negative reduce it. "
+                "Please see the SHAP waterfall and summary plots for per-feature detail and relative importance.")
         return text
     except Exception:
         return "Explanation not available."
@@ -378,76 +378,118 @@ def generate_final_diagnosis(img_prob, clinical_prob, fusion_prob):
 
 
 # ROUTES
-@app.route("/")
-def home():
-    # Landing auth page
-    if "user" in session:
-        return redirect(url_for("dashboard"))
+
+# Authentication Routes
+@app.route("/auth", methods=["GET"])
+def auth():
     return render_template("auth.html")
-
-
-@app.route("/dashboard")
-def dashboard():
-    if "user" not in session:
-        return redirect(url_for("home"))
-    user = session.get("user")
-    return render_template("index.html", user=user)
 
 
 @app.route("/signup", methods=["POST"])
 def signup():
-    name = request.form.get("signup_name", "").strip()
-    email = request.form.get("signup_email", "").strip()
-    password = request.form.get("signup_password", "")
+    # Support both old and new field names from the template
+    name = (request.form.get("name") or request.form.get("signup_name") or "").strip()
+    email = (request.form.get("email") or request.form.get("signup_email") or "").strip()
+    password = (request.form.get("password") or request.form.get("signup_password") or "").strip()
+    confirm_password = (
+        request.form.get("confirm_password")
+        or request.form.get("signup_confirm_password")
+        or ""
+    ).strip()
 
     if not name or not email or not password:
-        flash("All signup fields are required.", "danger")
-        return redirect(url_for("home"))
+        flash("All fields are required for signup.", "danger")
+        return redirect(url_for("auth"))
 
-    ok = create_user(name, email, password)
-    if not ok:
-        flash("An account with this email already exists.", "warning")
-        return redirect(url_for("home"))
+    if confirm_password and password != confirm_password:
+        flash("Passwords do not match.", "danger")
+        return redirect(url_for("auth"))
 
-    session["user"] = {"name": name, "email": email}
-    session.permanent = True
-    flash("Signup successful. You are now logged in.", "success")
-    return redirect(url_for("dashboard"))
+    if len(password) < 6:
+        flash("Password must be at least 6 characters.", "danger")
+        return redirect(url_for("auth"))
+
+    with open(USERS_FILE, "r") as f:
+        users = json.load(f)
+
+    for user in users:
+        if user["email"].lower() == email.lower():
+            flash("Email already registered. Please log in instead.", "danger")
+            return redirect(url_for("auth"))
+
+    user_id = str(len(users) + 1)
+    new_user = {
+        "id": user_id,
+        "email": email,
+        "name": name,
+        "password_hash": generate_password_hash(password),
+    }
+    users.append(new_user)
+
+    with open(USERS_FILE, "w") as f:
+        json.dump(users, f)
+
+    user = User(user_id, email, name)
+    login_user(user)
+    flash("Account created. You are now logged in.", "success")
+    return redirect(url_for("home"))
 
 
 @app.route("/login", methods=["POST"])
 def login():
-    email = request.form.get("login_email", "").strip()
-    password = request.form.get("login_password", "")
+    # Support both old and new field names from the template
+    email = (request.form.get("email") or request.form.get("login_email") or "").strip()
+    password = (request.form.get("password") or request.form.get("login_password") or "").strip()
 
     if not email or not password:
         flash("Email and password are required.", "danger")
-        return redirect(url_for("home"))
+        return redirect(url_for("auth"))
 
-    user = verify_user(email, password)
-    if not user:
-        flash("Invalid email or password.", "danger")
-        return redirect(url_for("home"))
+    try:
+        with open(USERS_FILE, "r") as f:
+            users = json.load(f)
+    except FileNotFoundError:
+        users = []
 
-    session["user"] = {"name": user["name"], "email": user["email"]}
-    session.permanent = True
-    flash("Logged in successfully.", "success")
-    return redirect(url_for("dashboard"))
+    for user_data in users:
+        if user_data["email"].lower() == email.lower():
+            if check_password_hash(user_data["password_hash"], password):
+                user = User(user_data["id"], user_data["email"], user_data["name"])
+                login_user(user)
+                flash("Logged in successfully.", "success")
+                return redirect(url_for("home"))
+            else:
+                flash("Invalid password.", "danger")
+                return redirect(url_for("auth"))
+
+    flash("Email not found. Please sign up first.", "danger")
+    return redirect(url_for("auth"))
 
 
-@app.route("/logout")
+@app.route("/logout", methods=["GET", "POST"])
+@login_required
 def logout():
-    session.pop("user", None)
-    flash("You have been logged out.", "info")
-    return redirect(url_for("home"))
+    logout_user()
+    flash("You have been logged out.", "success")
+    return redirect(url_for("auth"))
+
+
+@app.route("/")
+def home():
+    if not current_user.is_authenticated:
+        return redirect(url_for("auth"))
+    user_initial = current_user.name[0].upper() if current_user.name else "U"
+    return render_template(
+        "index.html",
+        user=current_user,
+        user_name=current_user.name,
+        user_initial=user_initial,
+    )
 
 @app.route("/predict", methods=["POST"])
+@login_required
 def predict():
     try:
-        if "user" not in session:
-            flash("Please log in to use the prediction feature.", "warning")
-            return redirect(url_for("home"))
-
         img_file = request.files["xray"]
         if img_file.filename == "":
             return "No file uploaded", 400
@@ -469,37 +511,22 @@ def predict():
         X_scaled = clinical_scaler.transform([clinical_values])
         clinical_pred = float(clinical_model.predict_proba(X_scaled)[0][1])
 
-        fusion_pred = (FUSION_W_IMAGE * img_pred) + (FUSION_W_CLINICAL * clinical_pred)
+        fusion_pred = (0.85 * img_pred) + (0.15 * clinical_pred)
 
         final_diagnosis = generate_final_diagnosis(img_pred, clinical_pred, fusion_pred)
 
-        # Risk band for UI
-        fusion_pct = fusion_pred * 100.0
-        if fusion_pct >= 80:
-            risk_band = "VERY HIGH"
-        elif fusion_pct >= 60:
-            risk_band = "HIGH"
-        elif fusion_pct >= 30:
-            risk_band = "MODERATE"
-        else:
-            risk_band = "LOW"
+        patient_name = (request.form.get("patient_name") or "").strip()
 
-        # Discrete final label for report
-        has_pneumonia = fusion_pred >= 0.5
-        if has_pneumonia:
-            report_label = "Pneumonia: Likely present"
-            report_symptoms = (
-                "The AI system estimates that this patient is likely to have pneumonia. "
-                "Typical associated symptoms include fever, cough (often productive), "
-                "shortness of breath, pleuritic chest pain, fatigue, and reduced oxygen saturation (SpO2)."
-            )
+        # Derive a simple risk band label for the UI
+        fusion_p = fusion_pred * 100.0
+        if fusion_p >= 80:
+            risk_band = "High risk"
+        elif fusion_p >= 60:
+            risk_band = "Moderate risk"
+        elif fusion_p >= 30:
+            risk_band = "Low–moderate risk"
         else:
-            report_label = "Pneumonia: Unlikely / low probability"
-            report_symptoms = (
-                "Based on the current chest X-ray and clinical features, the probability of pneumonia is low. "
-                "If the patient develops worsening cough, persistent high fever, breathing difficulty or very low SpO2, "
-                "clinical re‑evaluation is recommended."
-            )
+            risk_band = "Very low risk"
 
         gradcam_rel = generate_gradcam_overlay(upload_path, out_name=f"gradcam_{upload_name}.png")
 
@@ -508,6 +535,7 @@ def predict():
         explanation_text = make_explanation_text(img_pred, clinical_pred, fusion_pred, shap_wf_rel)
 
         patient_info = {
+            "Patient name": patient_name if patient_name else "N/A",
             "Age": age, "Fever days": fever_days, "SPO2": spo2,
             "Cough": "Yes" if cough==1 else "No",
             "Smoking": "Yes" if smoking==1 else "No",
@@ -526,42 +554,46 @@ def predict():
             "Fusion Prediction": f"{fusion_pred:.3f}"
         }
 
-        # Convert relative paths to absolute paths for PDF generation
-        xray_abs_path = os.path.join(PROJECT_ROOT, "static", "uploads", upload_name)
-        gradcam_abs_path = os.path.join(OUTPUTS_DIR, os.path.basename(gradcam_rel))
-        shap_summary_abs_path = os.path.join(OUTPUTS_DIR, os.path.basename(shap_summary_rel)) if shap_summary_rel else None
-        shap_waterfall_abs_path = os.path.join(OUTPUTS_DIR, os.path.basename(shap_wf_rel))
-        pdf_output_path = os.path.join(OUTPUTS_DIR, f"report_{upload_name}.pdf")
-        
-        # Get patient name from session or use default
-        patient_name = session.get("user", {}).get("name", "Patient")
-        
-        pdf_rel = generate_pdf_report(patient_name, age, fever_days, spo2, cough, smoking, diabetes,
-                                      img_pred, clinical_pred, fusion_pred,
-                                      "/static/uploads/" + upload_name, gradcam_rel, shap_summary_rel, shap_wf_rel,
-                                      xray_abs_path, gradcam_abs_path, shap_summary_abs_path, shap_waterfall_abs_path,
-                                      pdf_output_path)
+        pdf_rel = generate_pdf_report(
+            patient_info,
+            image_rel="/static/uploads/" + upload_name,
+            gradcam_rel=gradcam_rel,
+            shap_summary_rel=shap_summary_rel,
+            shap_wf_rel=shap_wf_rel,
+            predictions=predictions,
+            explanation_text=explanation_text,
+            final_diagnosis=final_diagnosis,
+            fusion_pred=fusion_pred,
+            risk_band=risk_band,
+            out_name=f"report_{upload_name}.pdf",
+        )
 
-        user = session.get("user")
-        return render_template("index.html",
-                               img_path="/static/uploads/" + upload_name,
-                               gradcam_path=gradcam_rel,
-                               shap_summary_path=shap_summary_rel,
-                               shap_waterfall_path=shap_wf_rel,
-                               img_pred=round(img_pred, 3),
-                               clinical_pred=round(clinical_pred, 3),
-                               fusion_pred=round(fusion_pred, 3),
-                               explanation_text=explanation_text,
-                               pdf_path=pdf_rel,
-                               final_diagnosis=final_diagnosis,
-                               risk_band=risk_band,
-                               user=user
-)
+        # Render the main dashboard with results instead of returning raw JSON
+        user_initial = current_user.name[0].upper() if current_user.name else "U"
+        return render_template(
+            "index.html",
+            user=current_user,
+            user_name=current_user.name,
+            user_initial=user_initial,
+            img_path="/static/uploads/" + upload_name,
+            gradcam_path=gradcam_rel,
+            shap_summary_path=shap_summary_rel,
+            shap_waterfall_path=shap_wf_rel,
+            img_pred=img_pred,
+            clinical_pred=clinical_pred,
+            fusion_pred=fusion_pred,
+            explanation_text=explanation_text,
+            pdf_path=pdf_rel,
+            final_diagnosis=final_diagnosis,
+            risk_band=risk_band,
+        )
     except Exception as e:
         print("REAL ERROR:", traceback.format_exc())
-        return f"INTERNAL ERROR: {str(e)}", 500
+        flash(f"An error occurred while running prediction: {e}", "danger")
+        return redirect(url_for("home"))
 
 @app.route("/download_report")
+@login_required
 def download_report():
     files = [os.path.join(OUTPUTS_DIR, f) for f in os.listdir(OUTPUTS_DIR) if f.endswith(".pdf")]
     if not files:

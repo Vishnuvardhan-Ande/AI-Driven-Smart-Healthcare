@@ -12,13 +12,9 @@ BATCH_SIZE = 16
 
 
 def fine_tune_model():
-    """
-    Fine‑tune DenseNet with stronger augmentation and callbacks to improve accuracy.
-    This will overwrite models/dense_best.h5 used by the Flask app.
-    """
     import tensorflow as tf
     from tensorflow.keras.preprocessing.image import ImageDataGenerator
-    from tensorflow.keras.callbacks import ModelCheckpoint, ReduceLROnPlateau, EarlyStopping
+    from tensorflow.keras.callbacks import ModelCheckpoint
     import os
 
     global DATA_DIR, IMG_SIZE, BATCH_SIZE
@@ -26,37 +22,25 @@ def fine_tune_model():
     print("Loading model for fine-tuning...")
     model = tf.keras.models.load_model("models/dense_best.h5")
 
-    print("Unfreezing deeper DenseNet convolution blocks...")
+    print("Unfreezing last DenseNet convolution blocks...")
+
     set_trainable = False
     for layer in model.layers:
         name = layer.name.lower()
-        if "conv4_block" in name or "conv5_block" in name:
+        if "conv5_block" in name:
             set_trainable = True
         layer.trainable = set_trainable
 
-    print("Layers successfully unfrozen from conv4_block onward.")
+    print("Layers successfully unfrozen from conv5_block onward.")
 
-    train_datagen = ImageDataGenerator(
-        rescale=1.0 / 255,
-        rotation_range=15,
-        width_shift_range=0.08,
-        height_shift_range=0.08,
-        zoom_range=0.15,
-        shear_range=0.08,
-        horizontal_flip=True,
-        fill_mode="nearest"
-    )
-
-    val_datagen = ImageDataGenerator(rescale=1.0 / 255)
-
-    train_gen = train_datagen.flow_from_directory(
+    train_gen = ImageDataGenerator(rescale=1./255).flow_from_directory(
         os.path.join(DATA_DIR, "train"),
         target_size=IMG_SIZE,
         batch_size=BATCH_SIZE,
         class_mode="binary"
     )
 
-    val_gen = val_datagen.flow_from_directory(
+    val_gen = ImageDataGenerator(rescale=1./255).flow_from_directory(
         os.path.join(DATA_DIR, "val"),
         target_size=IMG_SIZE,
         batch_size=BATCH_SIZE,
@@ -75,25 +59,12 @@ def fine_tune_model():
         save_best_only=True,
         mode="max"
     )
-    lr_sched = ReduceLROnPlateau(
-        monitor="val_loss",
-        factor=0.3,
-        patience=3,
-        verbose=1,
-        min_lr=1e-7
-    )
-    early = EarlyStopping(
-        monitor="val_loss",
-        patience=6,
-        restore_best_weights=True,
-        verbose=1
-    )
 
     model.fit(
         train_gen,
         validation_data=val_gen,
-        epochs=20,
-        callbacks=[ckpt, lr_sched, early]
+        epochs=5,
+        callbacks=[ckpt]
     )
 
-    print("Fine-tuning complete! Updated model saved to models/dense_best.h5")
+    print("Fine-tuning complete! Updated model saved.")

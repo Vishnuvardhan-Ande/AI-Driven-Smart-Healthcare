@@ -124,6 +124,49 @@
             color: #e5e7ff;
         }
 
+        /* Force label/placeholder readability on dark background */
+        .auth-form-pane label,
+        .auth-form-pane .form-label {
+            color: #ffffff !important;
+        }
+
+        .auth-form-pane ::placeholder {
+            color: rgba(229, 231, 255, 0.65) !important;
+        }
+
+        /* Loading overlay */
+        .loading-overlay {
+            position: fixed;
+            inset: 0;
+            background: rgba(15, 23, 42, 0.55);
+            backdrop-filter: blur(8px);
+            display: none;
+            align-items: center;
+            justify-content: center;
+            z-index: 2000;
+        }
+
+        .loading-card {
+            background: rgba(9, 12, 32, 0.92);
+            border-radius: 16px;
+            padding: 18px 20px;
+            border: 1px solid rgba(255, 255, 255, 0.10);
+            box-shadow: 0 24px 60px rgba(0, 0, 0, 0.55);
+            width: min(420px, calc(100vw - 48px));
+            text-align: center;
+        }
+
+        .loading-title {
+            font-weight: 700;
+            color: #ffffff;
+        }
+
+        .loading-subtitle {
+            color: #c9d1ff;
+            font-size: 0.9rem;
+            margin-bottom: 0;
+        }
+
         .btn-primary {
             background: linear-gradient(90deg, #4f46e5, #6366f1);
             border: none;
@@ -161,6 +204,14 @@
 
 <body>
 
+    <div id="loadingOverlay" class="loading-overlay" aria-hidden="true">
+        <div class="loading-card">
+            <div class="spinner-border text-info mb-3" role="status" aria-label="Loading"></div>
+            <div class="loading-title">Signing you in…</div>
+            <p class="loading-subtitle mt-1">Please wait a moment.</p>
+        </div>
+    </div>
+
     <div class="auth-wrapper">
         <div class="floating-circle circle-1"></div>
         <div class="floating-circle circle-2"></div>
@@ -173,7 +224,7 @@
                         <span class="badge bg-success rounded-pill me-1" style="font-size:0.65rem;">LIVE</span>
                         Smart pneumonia risk triage
                     </span>
-                    <h1 class="mt-3 mb-3">Welcome back, clinician.</h1>
+                    <h1 class="mt-3 mb-3">Welcome back</h1>
                     <p class="mb-0">
                         Securely upload chest X‑ray images and clinical details.
                         Our fusion AI model combines imaging + clinical features
@@ -209,7 +260,7 @@
                     <p class="text-muted mb-3" style="font-size: 0.85rem;">
                         Use your registered email to access the diagnosis workspace.
                     </p>
-                    <form method="POST" action="{{ url_for('login') }}">
+                    <form id="loginForm" method="POST" action="{{ url_for('login') }}">
                         <div class="mb-3">
                             <label class="form-label">Email</label>
                             <input type="email" name="login_email" class="form-control" placeholder="you@hospital.org"
@@ -229,7 +280,7 @@
                     <p class="text-muted mb-3" style="font-size: 0.85rem;">
                         Set up a clinician account to generate and download AI reports.
                     </p>
-                    <form method="POST" action="{{ url_for('signup') }}">
+                    <form id="signupForm" method="POST" action="{{ url_for('signup') }}">
                         <div class="mb-3">
                             <label class="form-label">Full name</label>
                             <input type="text" name="signup_name" class="form-control" placeholder="Dr. Alex Doe"
@@ -245,6 +296,11 @@
                             <input type="password" name="signup_password" class="form-control"
                                 placeholder="Create a strong password" required>
                         </div>
+                        <div class="mb-3">
+                            <label class="form-label">Confirm password</label>
+                            <input type="password" name="signup_confirm_password" class="form-control"
+                                placeholder="Re-enter your password" required>
+                        </div>
                         <button class="btn btn-primary w-100 mt-2">Sign up</button>
                     </form>
                 </div>
@@ -257,6 +313,17 @@
         const btnSignup = document.getElementById('btn-signup');
         const paneLogin = document.getElementById('pane-login');
         const paneSignup = document.getElementById('pane-signup');
+        const overlay = document.getElementById("loadingOverlay");
+        const loginForm = document.getElementById("loginForm");
+        const signupForm = document.getElementById("signupForm");
+
+        function showOverlay(title) {
+            if (!overlay) return;
+            const titleEl = overlay.querySelector(".loading-title");
+            if (titleEl && title) titleEl.textContent = title;
+            overlay.style.display = "flex";
+            overlay.setAttribute("aria-hidden", "false");
+        }
 
         btnLogin.addEventListener('click', () => {
             btnLogin.classList.add('btn-light', 'active');
@@ -275,6 +342,13 @@
             paneLogin.style.display = 'none';
             paneSignup.style.display = 'block';
         });
+
+        if (loginForm) {
+            loginForm.addEventListener("submit", () => showOverlay("Signing you in…"));
+        }
+        if (signupForm) {
+            signupForm.addEventListener("submit", () => showOverlay("Creating your account…"));
+        }
     </script>
 
 </body>

@@ -32,5 +32,48 @@ ai-healthcare/
 └── README.md
 
 ## ▶️ How to Run
+
+### Quick Start
+**Windows:**
+```bash
+start_app.bat
+```
+
+**Linux/Mac:**
 ```bash
 python src/app.py
+```
+
+### Troubleshooting
+
+**If you see "Image model is not loaded" error:**
+
+1. **Check environment variables:** Make sure `SKIP_IMAGE_MODEL` is not set to `1`
+   ```bash
+   # Windows PowerShell
+   $env:SKIP_IMAGE_MODEL = ""
+   
+   # Windows CMD
+   set SKIP_IMAGE_MODEL=
+   
+   # Linux/Mac
+   unset SKIP_IMAGE_MODEL
+   ```
+
+2. **Verify TensorFlow installation:**
+   ```bash
+   python -c "import tensorflow as tf; print(tf.__version__)"
+   ```
+   Should show `2.16.1` or higher.
+
+3. **Check model file exists:**
+   ```bash
+   # Should show the file exists
+   dir models\dense_best.h5  # Windows
+   ls models/dense_best.h5   # Linux/Mac
+   ```
+
+### Requirements
+Install dependencies:
+```bash
+pip install -r requirements.txt
